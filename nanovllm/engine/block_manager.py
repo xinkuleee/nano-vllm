@@ -2,6 +2,7 @@ from collections import deque
 import xxhash
 import numpy as np
 
+from nanovllm.engine.kv_cache import AllocationPlan, KVCacheStats
 from nanovllm.engine.sequence import Sequence
 
 
@@ -55,7 +56,18 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate(self, seq: Sequence) -> int:
+    @property
+    def stats(self) -> KVCacheStats:
+        return KVCacheStats(
+            num_total_blocks=len(self.blocks),
+            num_used_blocks=len(self.used_block_ids),
+            num_free_blocks=len(self.free_block_ids),
+            num_prefix_cache_entries=len(self.hash_to_block_id),
+        )
+
+    def plan_allocation(self, seq: Sequence) -> AllocationPlan | None:
+        if seq.block_size != self.block_size:
+            raise ValueError("sequence and cache manager block sizes must match")
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
@@ -69,10 +81,15 @@ class BlockManager:
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
         if len(self.free_block_ids) < num_new_blocks:
-            return -1
-        return num_cached_blocks
+            return None
+        return AllocationPlan(num_cached_blocks, num_new_blocks, self.block_size)
 
-    def allocate(self, seq: Sequence, num_cached_blocks: int):
+    def allocate(self, seq: Sequence, allocation: AllocationPlan):
+        if allocation.block_size != self.block_size:
+            raise ValueError("allocation plan belongs to a different cache manager")
+        if len(self.free_block_ids) < allocation.num_free_blocks_required:
+            raise RuntimeError("KV allocation plan is no longer admissible")
+        num_cached_blocks = allocation.num_cached_blocks
         assert not seq.block_table
         h = -1
         for i in range(num_cached_blocks):
@@ -91,7 +108,7 @@ class BlockManager:
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
-    def deallocate(self, seq: Sequence):
+    def free(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
             block.ref_count -= 1
@@ -103,13 +120,19 @@ class BlockManager:
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
-    def may_append(self, seq: Sequence):
+    def append_slot(self, seq: Sequence):
         if len(seq) % self.block_size == 1:
+            if not self.free_block_ids:
+                raise RuntimeError("cannot append a KV slot without a free block")
             seq.block_table.append(self._allocate_block())
 
-    def hash_blocks(self, seq: Sequence):
+    def commit(self, seq: Sequence, token_count: int):
+        if token_count <= 0:
+            raise ValueError("committed token count must be positive")
+        if seq.num_cached_tokens + token_count > len(seq):
+            raise ValueError("cannot commit past the end of a sequence")
         start = seq.num_cached_tokens // self.block_size
-        end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
+        end = (seq.num_cached_tokens + token_count) // self.block_size
         if start == end: return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):

@@ -18,9 +18,32 @@ A lightweight vLLM implementation built from scratch.
 
 ## Installation
 
+For the original NVIDIA inference path on a Linux GPU server, start with:
+
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+uv sync --locked --extra nvidia
 ```
+
+The exact PyTorch/CUDA/FlashAttention/Triton combination still needs to be pinned
+and validated on the target server; the current checkpoint has only been tested
+locally for CPU control-plane development.
+
+### Local control-plane development (macOS/CPU)
+
+The scheduler, logical KV-cache, prefix-cache, preemption, and worker contracts
+can be developed without a GPU or GPU packages:
+
+```bash
+uv sync --locked
+uv run --locked pytest
+```
+
+This environment intentionally does not install PyTorch, Triton, FlashAttention,
+or CUDA. It validates runtime control logic, not model execution or GPU kernels.
+
+The `inference` extra provides the framework/model dependencies without selecting
+a GPU kernel stack. The `nvidia` extra includes those dependencies plus Triton
+and FlashAttention for a Linux NVIDIA server.
 
 ## Model Download
 
@@ -42,6 +65,15 @@ prompts = ["Hello, Nano-vLLM."]
 outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
+
+## Runtime architecture
+
+The extensible-runtime branch documents its scheduling, KV-cache, model, and
+attention-backend boundaries in [docs/architecture.md](docs/architecture.md).
+The completed local checkpoint, review evidence, and remaining validation matrix
+are in [docs/phase1-summary.md](docs/phase1-summary.md).
+The scope and honest resume/interview narrative are in
+[docs/resume-and-interview.md](docs/resume-and-interview.md).
 
 ## Benchmark
 

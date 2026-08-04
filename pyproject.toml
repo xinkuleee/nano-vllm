@@ -12,15 +12,40 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "torch>=2.4.0",
-    "triton>=3.0.0",
-    "transformers>=4.51.0",
-    "flash-attn",
+    "numpy>=1.26",
     "xxhash",
+]
+
+[project.optional-dependencies]
+inference = [
+    "torch>=2.4.0",
+    "transformers>=4.51.0",
+    "tqdm",
+]
+nvidia = [
+    "torch>=2.4.0",
+    "transformers>=4.51.0",
+    "tqdm",
+    "triton>=3.0.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "flash-attn; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
 ]
 
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["."]
+testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["."]

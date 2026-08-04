@@ -10,6 +10,11 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.contracts import (
+    EngineStepResult,
+    RequestOutput,
+    RunnerBatch,
+)
 
 
 class LLMEngine:
@@ -18,7 +23,8 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
-        Sequence.block_size = config.kvcache_block_size
+        self.config = config
+        self._closed = False
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -35,24 +41,48 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        if self._closed:
+            return
+        self._closed = True
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
             p.join()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.exit()
+
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
+        seq = Sequence(prompt, sampling_params, self.config.kvcache_block_size)
         self.scheduler.add(seq)
+        return seq.seq_id
 
-    def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens
+    def step(self) -> EngineStepResult:
+        scheduled = self.scheduler.schedule()
+        runner_output = self.model_runner.call(
+            "run",
+            RunnerBatch.from_schedule(scheduled),
+        )
+        if runner_output is None:
+            raise RuntimeError("rank-zero runner did not return a result")
+        self.scheduler.postprocess(scheduled, runner_output)
+        outputs = tuple(
+            RequestOutput(seq.seq_id, tuple(seq.completion_token_ids))
+            for seq in scheduled.sequences
+            if seq.is_finished
+        )
+        return EngineStepResult(
+            outputs=outputs,
+            mode=scheduled.mode,
+            num_scheduled_tokens=scheduled.num_scheduled_tokens,
+            preempted_seq_ids=scheduled.preempted_seq_ids,
+            cache_stats=self.scheduler.cache_manager.stats,
+        )
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -62,7 +92,7 @@ class LLMEngine:
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
-    ) -> list[str]:
+    ) -> list[dict[str, str | list[int]]]:
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
@@ -72,19 +102,25 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
+            result = self.step()
+            if result.mode.is_prefill:
+                prefill_throughput = result.num_scheduled_tokens / (perf_counter() - t)
             else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
+                decode_throughput = result.num_scheduled_tokens / (perf_counter() - t)
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
             })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            for output in result.outputs:
+                outputs[output.request_id] = output.token_ids
                 pbar.update(1)
         pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [
+            {
+                "text": self.tokenizer.decode(token_ids),
+                "token_ids": list(token_ids),
+            }
+            for token_ids in outputs
+        ]
         return outputs
