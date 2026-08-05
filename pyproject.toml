@@ -43,9 +43,12 @@ Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 default-groups = ["dev"]
 
 [tool.pytest.ini_options]
-addopts = "-ra"
+addopts = "-ra -m 'not gpu'"
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "gpu: requires a Linux NVIDIA GPU and the nvidia optional dependencies",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -74,6 +74,12 @@ The completed local checkpoint, review evidence, and remaining validation matrix
 are in [docs/phase1-summary.md](docs/phase1-summary.md).
 The scope and honest resume/interview narrative are in
 [docs/resume-and-interview.md](docs/resume-and-interview.md).
+For an NVIDIA laptop, follow the reproducible
+[Windows 11 + WSL2 GPU validation guide](docs/windows-wsl2-gpu.md); native
+Windows is not a supported Triton/FlashAttention execution path.
+The guide uses `scripts/gpu_env.py` and `scripts/gpu_baseline.py` to save
+environment, eager/CUDA Graph correctness, latency, throughput, KV-cache, and
+peak-memory evidence as local JSON artifacts.
 
 ## Benchmark
 
