@@ -80,6 +80,16 @@ Windows is not a supported Triton/FlashAttention execution path.
 The guide uses `scripts/gpu_env.py` and `scripts/gpu_baseline.py` to save
 environment, eager/CUDA Graph correctness, latency, throughput, KV-cache, and
 peak-memory evidence as local JSON artifacts.
+Two teaching extensions build on that baseline:
+
+- [Triton FlashAttention](docs/teaching-flash-attention.md) implements packed
+  causal prefill with online softmax and plugs into `AttentionBackend`.
+- [Qwen3 Mini-MoE](docs/teaching-mini-moe.md) implements top-k routing, dense
+  and sparse dispatch, plus a checkpoint-compatible Qwen3 overlay.
+
+Both extensions are currently teaching candidates: local control-plane checks
+pass, while NVIDIA JIT compilation, end-to-end parity, and performance remain
+gated by the documented WSL2/RTX 3060 runs.
 
 ## Benchmark
 

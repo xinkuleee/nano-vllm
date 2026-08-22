@@ -34,7 +34,10 @@ WORKLOADS = {
     "quick": Workload("quick", 128, 32, 4, 1, 3),
     "standard": Workload("standard", 256, 64, 8, 1, 5),
 }
-REQUIRED_MODEL_ARCHITECTURE = "Qwen3ForCausalLM"
+SUPPORTED_MODEL_ARCHITECTURES = {
+    "Qwen3ForCausalLM",
+    "Qwen3MiniMoEForCausalLM",
+}
 
 
 def _positive_int(value: str) -> int:
@@ -51,6 +54,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True, type=Path, help="local Qwen3 model directory")
     parser.add_argument("--output", required=True, type=Path, help="JSON result path")
     parser.add_argument("--mode", choices=("eager", "cudagraph"), default="eager")
+    parser.add_argument(
+        "--attention-backend",
+        choices=("flash_attention", "triton_flash_attention"),
+        default="flash_attention",
+    )
     parser.add_argument("--workload", choices=tuple(WORKLOADS), default="quick")
     parser.add_argument("--prompt-length", type=_positive_int)
     parser.add_argument("--output-length", type=_positive_int)
@@ -137,8 +145,11 @@ def compare_token_outputs(
     left_report: dict[str, Any],
     right_report: dict[str, Any],
 ) -> dict[str, Any]:
-    comparable_fields = ("model", "workload")
-    ignored_engine_fields = {"num_kvcache_blocks"}
+    left_model = left_report.get("comparison_model", left_report.get("model"))
+    right_model = right_report.get("comparison_model", right_report.get("model"))
+    # Physical cache capacity varies with the process and the attention backend
+    # is the implementation under test. Neither changes the logical workload.
+    ignored_engine_fields = {"attention_backend", "num_kvcache_blocks"}
     left_engine = {
         key: value for key, value in left_report.get("engine", {}).items()
         if key not in ignored_engine_fields
@@ -147,10 +158,11 @@ def compare_token_outputs(
         key: value for key, value in right_report.get("engine", {}).items()
         if key not in ignored_engine_fields
     }
-    configuration_matches = all(
-        left_report.get(field) == right_report.get(field)
-        for field in comparable_fields
-    ) and left_engine == right_engine
+    configuration_matches = (
+        left_model == right_model
+        and left_report.get("workload") == right_report.get("workload")
+        and left_engine == right_engine
+    )
     left = [item["output_token_ids"] for item in left_report.get("measurements", [])]
     right = [item["output_token_ids"] for item in right_report.get("measurements", [])]
     comparable = configuration_matches and bool(left) and len(left) == len(right)
@@ -192,12 +204,26 @@ def _validate_model_architecture(model: Path) -> None:
 
     config = AutoConfig.from_pretrained(model)
     architectures = config.architectures or []
-    if REQUIRED_MODEL_ARCHITECTURE not in architectures:
+    if not SUPPORTED_MODEL_ARCHITECTURES.intersection(architectures):
         requested = ", ".join(architectures) or config.model_type or "<missing>"
+        supported = ", ".join(sorted(SUPPORTED_MODEL_ARCHITECTURES))
         raise ValueError(
-            f"unsupported model architecture {requested}; this baseline requires "
-            f"{REQUIRED_MODEL_ARCHITECTURE} (recommended: Qwen/Qwen3-0.6B)"
+            f"unsupported model architecture {requested}; this baseline supports "
+            f"{supported} (recommended base: Qwen/Qwen3-0.6B)"
         )
+    return config
+
+
+def _comparison_model(model: Path, model_config: Any) -> str:
+    """Resolve the dense checkpoint identity used for parity reports."""
+
+    base_model = getattr(model_config, "mini_moe_base_model", None)
+    if base_model is None:
+        return str(model.resolve())
+    base_path = Path(base_model).expanduser()
+    if not base_path.is_absolute():
+        base_path = model / base_path
+    return str(base_path.resolve())
 
 
 def _generate_measured(
@@ -259,7 +285,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available; run scripts/gpu_env.py first")
 
-    _validate_model_architecture(args.model)
+    model_config = _validate_model_architecture(args.model)
+    if (
+        getattr(model_config, "mini_moe_implementation", None) == "sparse_dispatch"
+        and args.mode != "eager"
+    ):
+        raise ValueError("Mini-MoE sparse_dispatch requires --mode eager")
     _seed_everything(torch, args.seed)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     prompts = _build_prompts(tokenizer, workload, args.seed)
@@ -278,6 +309,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        attention_backend=args.attention_backend,
     )
     init_seconds = time.perf_counter() - init_started
     warmup_measurements = []
@@ -327,6 +359,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "software": {"python": sys.version.split()[0], "torch": torch.__version__, "cuda": torch.version.cuda},
         "model": str(args.model.resolve()),
+        "comparison_model": _comparison_model(args.model, model_config),
         "mode": args.mode,
         "workload": asdict(workload),
         "engine": {
@@ -335,6 +368,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "max_num_seqs": args.max_num_seqs,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "tensor_parallel_size": 1,
+            "attention_backend": args.attention_backend,
             "num_kvcache_blocks": llm.config.num_kvcache_blocks,
         },
         "initialization_seconds": init_seconds,

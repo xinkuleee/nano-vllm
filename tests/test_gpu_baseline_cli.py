@@ -26,6 +26,7 @@ def make_args(**overrides):
         "max_num_batched_tokens": 1024,
         "max_num_seqs": 8,
         "gpu_memory_utilization": 0.75,
+        "attention_backend": "flash_attention",
     }
     values.update(overrides)
     return Namespace(**values)
@@ -173,3 +174,71 @@ def test_compare_token_outputs_checks_every_request_and_iteration():
     assert comparison["comparable"] is True
     assert comparison["matching_iterations"] == 1
     assert comparison["all_token_ids_match"] is False
+
+
+def test_compare_token_outputs_allows_backend_parity_comparison():
+    shared = {
+        "model": "model",
+        "workload": {"name": "quick"},
+        "measurements": [{"output_token_ids": [[1, 2], [3, 4]]}],
+    }
+    flash = {
+        **shared,
+        "engine": {"max_model_len": 1024, "attention_backend": "flash_attention"},
+    }
+    triton = {
+        **shared,
+        "engine": {
+            "max_model_len": 1024,
+            "attention_backend": "triton_flash_attention",
+        },
+    }
+
+    comparison = gpu_baseline.compare_token_outputs(flash, triton)
+
+    assert comparison["configuration_matches"] is True
+    assert comparison["all_token_ids_match"] is True
+
+
+def test_compare_token_outputs_allows_declared_mini_moe_base_model():
+    shared = {
+        "comparison_model": "/models/qwen",
+        "workload": {"name": "smoke"},
+        "engine": {"max_model_len": 1024},
+        "measurements": [{"output_token_ids": [[1, 2, 3]]}],
+    }
+
+    comparison = gpu_baseline.compare_token_outputs(
+        {**shared, "model": "/models/qwen"},
+        {**shared, "model": "/models/qwen-mini-moe"},
+    )
+
+    assert comparison["configuration_matches"] is True
+    assert comparison["all_token_ids_match"] is True
+
+
+def test_compare_token_outputs_rejects_unrelated_model_paths():
+    shared = {
+        "workload": {"name": "smoke"},
+        "engine": {"max_model_len": 1024},
+        "measurements": [{"output_token_ids": [[1, 2, 3]]}],
+    }
+
+    comparison = gpu_baseline.compare_token_outputs(
+        {**shared, "model": "/models/one"},
+        {**shared, "model": "/models/two"},
+    )
+
+    assert comparison["configuration_matches"] is False
+    assert comparison["all_token_ids_match"] is False
+
+
+def test_comparison_model_uses_converter_declared_dense_source(tmp_path):
+    class Config:
+        mini_moe_base_model = "../dense"
+
+    overlay = tmp_path / "overlays" / "mini-moe"
+
+    assert gpu_baseline._comparison_model(overlay, Config()) == str(
+        (overlay / "../dense").resolve()
+    )

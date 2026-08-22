@@ -19,19 +19,25 @@ def _require_gpu_stack():
     return torch
 
 
-def _model_path() -> Path:
-    value = os.environ.get("NANOVLLM_TEST_MODEL")
+def _model_path(variable: str = "NANOVLLM_TEST_MODEL") -> Path:
+    value = os.environ.get(variable)
     if not value:
-        pytest.skip("set NANOVLLM_TEST_MODEL to a local Qwen3 model directory")
+        pytest.skip(f"set {variable} to a local Qwen3 model directory")
     path = Path(value).expanduser()
     if not path.is_dir():
-        pytest.fail(f"NANOVLLM_TEST_MODEL is not a directory: {path}")
+        pytest.fail(f"{variable} is not a directory: {path}")
     return path
 
 
-def _run_once(enforce_eager: bool, seed: int = 0) -> list[list[int]]:
+def _run_once(
+    enforce_eager: bool,
+    seed: int = 0,
+    *,
+    model: Path | None = None,
+    attention_backend: str = "flash_attention",
+) -> list[list[int]]:
     torch = _require_gpu_stack()
-    model = _model_path()
+    model = model or _model_path()
     from nanovllm import LLM, SamplingParams
 
     torch.manual_seed(seed)
@@ -44,6 +50,7 @@ def _run_once(enforce_eager: bool, seed: int = 0) -> list[list[int]]:
         max_num_batched_tokens=1024,
         max_num_seqs=8,
         gpu_memory_utilization=0.75,
+        attention_backend=attention_backend,
     )
     try:
         outputs = llm.generate(
@@ -75,3 +82,26 @@ def test_eager_cuda_graph_token_parity():
     graph_outputs = _run_once(enforce_eager=False, seed=0)
 
     assert graph_outputs == eager_outputs
+
+
+def test_triton_flash_attention_engine_token_parity():
+    flash_outputs = _run_once(
+        enforce_eager=True, seed=0, attention_backend="flash_attention"
+    )
+    triton_outputs = _run_once(
+        enforce_eager=True, seed=0, attention_backend="triton_flash_attention"
+    )
+
+    assert triton_outputs == flash_outputs
+
+
+def test_cloned_expert_mini_moe_model_token_parity():
+    dense_model = _model_path()
+    mini_moe_model = _model_path("NANOVLLM_TEST_MINI_MOE_MODEL")
+
+    dense_outputs = _run_once(enforce_eager=True, seed=0, model=dense_model)
+    mini_moe_outputs = _run_once(
+        enforce_eager=True, seed=0, model=mini_moe_model
+    )
+
+    assert mini_moe_outputs == dense_outputs

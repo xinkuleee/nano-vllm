@@ -26,3 +26,12 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+        if (
+            getattr(self.hf_config, "mini_moe_implementation", None)
+            == "sparse_dispatch"
+            and not self.enforce_eager
+        ):
+            raise ValueError(
+                "Mini-MoE sparse_dispatch uses dynamic token shapes and requires "
+                "enforce_eager=True; use dense_masked for CUDA Graph capture"
+            )

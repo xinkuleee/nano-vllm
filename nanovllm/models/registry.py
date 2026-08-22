@@ -23,9 +23,21 @@ def _create_qwen3(context: ModelBuildContext) -> nn.Module:
     )
 
 
+def _create_qwen3_mini_moe(context: ModelBuildContext) -> nn.Module:
+    from nanovllm.layers.backends import create_attention_backend
+    from nanovllm.models.qwen3_mini_moe import Qwen3MiniMoEForCausalLM
+
+    return Qwen3MiniMoEForCausalLM(
+        context.hf_config,
+        attention_backend=create_attention_backend(context.attention_backend),
+    )
+
+
 _MODEL_REGISTRY: dict[str, ModelFactory] = {
     "Qwen3ForCausalLM": _create_qwen3,
     "qwen3": _create_qwen3,
+    "Qwen3MiniMoEForCausalLM": _create_qwen3_mini_moe,
+    "qwen3_mini_moe": _create_qwen3_mini_moe,
 }
 
 

@@ -53,8 +53,17 @@ def _create_flash_attention_backend() -> AttentionBackend:
     return FlashAttentionBackend()
 
 
+def _create_triton_attention_backend() -> AttentionBackend:
+    # This backend is optional and should not make control-plane imports require
+    # PyTorch/Triton.
+    from nanovllm.layers.triton_attention_backend import TritonFlashAttentionBackend
+
+    return TritonFlashAttentionBackend()
+
+
 _BACKENDS: dict[str, AttentionBackendFactory] = {
     "flash_attention": _create_flash_attention_backend,
+    "triton_flash_attention": _create_triton_attention_backend,
 }
 
 
