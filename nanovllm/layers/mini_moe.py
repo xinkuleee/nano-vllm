@@ -1,15 +1,17 @@
 """Small, auditable mixture-of-experts feed-forward layer.
 
-This is an inference teaching implementation, not a grouped-GEMM performance
+This is an inference teaching implementation, not a production grouped-GEMM
 kernel.  It exposes the complete MoE algorithm: router logits, top-k selection,
 renormalised gates, expert computation, weighted combine, and load statistics.
 
 ``implementation="dense_masked"`` evaluates every expert and masks its output.
 It is wasteful but static-shape and CUDA-Graph friendly.
-``implementation="sparse_dispatch"`` sends only selected tokens to each expert,
-which demonstrates real sparse execution but uses a Python expert loop and is
-therefore eager-only.  A production next step replaces that loop with a sorted
-token permutation and grouped GEMM.
+``implementation="sparse_reference"`` is the readable PyTorch reference.
+``implementation="sparse_dispatch"`` performs token permutation, two grouped
+GEMMs, and weighted unpermutation with custom Triton kernels
+(``triton_grouped`` is an explicit alias).  All sparse paths use dynamic token
+grouping or per-forward workspaces and are therefore kept eager-only in this
+teaching runtime.
 """
 
 from __future__ import annotations
@@ -68,7 +70,12 @@ class MiniMoE(nn.Module):
             raise ValueError("MiniMoE requires at least two experts")
         if not 1 <= top_k <= len(experts):
             raise ValueError("top_k must be between one and num_experts")
-        if implementation not in {"dense_masked", "sparse_dispatch"}:
+        if implementation not in {
+            "dense_masked",
+            "sparse_reference",
+            "sparse_dispatch",
+            "triton_grouped",
+        }:
             raise ValueError("unknown MiniMoE implementation")
         self.hidden_size = hidden_size
         self.num_experts = len(experts)
@@ -76,6 +83,14 @@ class MiniMoE(nn.Module):
         self.implementation = implementation
         self.router = nn.Linear(hidden_size, self.num_experts, bias=False)
         self.experts = nn.ModuleList(experts)
+        # Inference-only packed copies.  The first call happens after checkpoint
+        # loading in ModelRunner, so subsequent requests avoid a torch.stack.
+        # The parameter version is part of the key so normal in-place updates
+        # invalidate the packed copy.  Direct ``parameter.data`` mutation cannot
+        # be observed by PyTorch; callers doing that must clear this cache.
+        self._triton_weight_cache: tuple[
+            tuple[tuple[int, int], ...], torch.Tensor, torch.Tensor
+        ] | None = None
 
     def route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # Model weights follow the checkpoint dtype; promote only the small
@@ -99,8 +114,10 @@ class MiniMoE(nn.Module):
         weights, indices = self.route(flat)
         if self.implementation == "dense_masked":
             output = self._dense_masked(flat, weights, indices)
+        elif self.implementation == "sparse_reference":
+            output = self._sparse_reference(flat, weights, indices)
         else:
-            output = self._sparse_dispatch(flat, weights, indices)
+            output = self._triton_grouped(flat, weights, indices)
         output = output.reshape(original_shape)
         if return_routing:
             return output, weights.reshape(*original_shape[:-1], self.top_k), indices.reshape(
@@ -128,7 +145,7 @@ class MiniMoE(nn.Module):
             output += expert_output * expert_weight.unsqueeze(-1)
         return output
 
-    def _sparse_dispatch(
+    def _sparse_reference(
         self,
         hidden_states: torch.Tensor,
         weights: torch.Tensor,
@@ -143,3 +160,75 @@ class MiniMoE(nn.Module):
             weighted = expert_output * weights[token_indices, topk_slots].unsqueeze(-1)
             output.index_add_(0, token_indices, weighted)
         return output
+
+    def _packed_triton_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pack Qwen expert weights for the grouped-kernel call."""
+
+        if not all(
+            hasattr(expert, "gate_up_proj") and hasattr(expert, "down_proj")
+            for expert in self.experts
+        ):
+            raise TypeError(
+                "triton_grouped requires Qwen-style experts with "
+                "gate_up_proj and down_proj weights"
+            )
+        gate_up_parameters = [
+            expert.gate_up_proj.weight for expert in self.experts
+        ]
+        down_parameters = [expert.down_proj.weight for expert in self.experts]
+        storage_key = tuple(
+            (parameter.data_ptr(), parameter._version)
+            for parameter in gate_up_parameters + down_parameters
+        )
+        cached = self._triton_weight_cache
+        if cached is not None and cached[0] == storage_key:
+            return cached[1], cached[2]
+        gate_up = torch.stack(gate_up_parameters).detach().contiguous()
+        down = torch.stack(down_parameters).detach().contiguous()
+        self._triton_weight_cache = (storage_key, gate_up, down)
+        return gate_up, down
+
+    def clear_triton_weight_cache(self) -> None:
+        """Discard inference-only stacked expert weights after raw mutation."""
+
+        self._triton_weight_cache = None
+
+    def _triton_grouped(
+        self,
+        hidden_states: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if not hidden_states.is_cuda:
+            raise ValueError("triton_grouped requires CUDA hidden states")
+        if not all(
+            hasattr(expert, "gate_up_proj") and hasattr(expert, "down_proj")
+            for expert in self.experts
+        ):
+            raise TypeError(
+                "triton_grouped requires Qwen-style experts with "
+                "gate_up_proj and down_proj weights"
+            )
+        if any(
+            getattr(projection, "tp_size", 1) != 1
+            for expert in self.experts
+            for projection in (expert.gate_up_proj, expert.down_proj)
+        ):
+            raise ValueError("teaching triton_grouped currently requires tensor_parallel_size=1")
+        if any(
+            getattr(projection, "bias", None) is not None
+            for expert in self.experts
+            for projection in (expert.gate_up_proj, expert.down_proj)
+        ):
+            raise ValueError("teaching triton_grouped requires bias-free expert projections")
+        from nanovllm.layers.triton_moe import triton_grouped_swiglu_moe
+
+        gate_up_weights, down_weights = self._packed_triton_weights()
+        return triton_grouped_swiglu_moe(
+            hidden_states,
+            weights,
+            indices,
+            gate_up_weights,
+            down_weights,
+            validate_expert_range=False,
+        )

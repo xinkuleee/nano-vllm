@@ -3,6 +3,9 @@
 This document describes how to present the Phase 1 refactor accurately. It is
 not a performance report. Runtime correctness and performance must be measured
 in a later validation phase before any quantitative claim is put on a resume.
+The “not implemented” statements below describe that historical Phase 1 commit;
+later teaching branches add candidate Triton FlashAttention and Mini-MoE
+kernels, whose NVIDIA validation remains pending.
 
 ## Project positioning
 

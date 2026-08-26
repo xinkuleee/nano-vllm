@@ -83,6 +83,12 @@ class Scheduler:
                 tuple(scheduled),
                 self.max_num_batched_tokens,
             )
+        if self.waiting and not self.running:
+            seq = self.waiting[0]
+            raise RuntimeError(
+                f"request {seq.seq_id} requires {seq.num_blocks} KV-cache blocks, "
+                f"but only {self.cache_manager.stats.num_total_blocks} exist"
+            )
 
         # decode
         preempted_seq_ids = []
@@ -102,7 +108,11 @@ class Scheduler:
                     token_start=len(seq) - 1,
                     token_count=1,
                 ))
-        assert scheduled
+        if not scheduled:
+            raise RuntimeError(
+                "no running request can reserve its next KV-cache block; "
+                "the active context exceeds cache capacity"
+            )
         self.running.extendleft(
             entry.sequence for entry in reversed(scheduled)
         )
@@ -142,7 +152,10 @@ class Scheduler:
             if batch.is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(update.token_id)
-            if (not seq.ignore_eos and update.token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            if (
+                (not seq.ignore_eos and update.token_id == self.eos)
+                or seq.num_completion_tokens >= seq.max_tokens
+            ):
                 seq.status = SequenceStatus.FINISHED
                 self.cache_manager.free(seq)
                 self.running.remove(seq)

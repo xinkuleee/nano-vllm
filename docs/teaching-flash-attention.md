@@ -30,6 +30,22 @@ attention algorithm, while “paged attention” describes how decode reads a
 logically contiguous sequence from physical KV-cache pages. A full inference
 engine needs both.
 
+The three labels answer different questions:
+
+```mermaid
+flowchart TD
+    A["Attention request"] --> P{"Phase?"}
+    P -->|"many prompt queries"| PF["prefill"]
+    P -->|"one new query/request"| D["decode"]
+    PF --> L{"K/V layout?"}
+    L -->|"consecutive rows"| CT["custom Triton FlashAttention"]
+    L -->|"block table"| PP["external flash-attn paged prefill"]
+    D --> PD["external flash-attn paged decode"]
+```
+
+`Triton` is the implementation language, `contiguous` or `paged` is the memory
+layout, and `prefill` or `decode` is the inference phase. They are not synonyms.
+
 ## The problem being solved
 
 Ordinary attention conceptually forms
@@ -96,6 +112,28 @@ p_q = N_K - N_Q + p_{q,mathrm{local}}.
 $$
 
 That is why the kernel consumes both `cu_seqlens_q` and `cu_seqlens_k`.
+
+## The KV-cache write kernel, line by line
+
+`store_kv_cache_kernel` in `nanovllm/layers/flash_attention_backend.py` is the
+other custom Triton kernel used by both attention backends. It does not compute
+attention; it places newly produced K/V rows into their physical cache slots.
+
+1. `token_index = tl.program_id(0)` assigns one Triton program to one new token.
+2. `slot = tl.load(slot_mapping_ptr + token_index)` reads the physical cache
+   slot selected by the scheduler and block manager.
+3. `if slot == -1: return` ignores padded graph rows that must not update cache.
+4. `tl.arange(0, width)` enumerates the flattened
+   `num_kv_heads * head_dim` features for that token.
+5. The two `tl.load` calls read its K and V vectors using their row strides.
+6. `cache_offsets = slot * width + offsets` translates the logical slot into
+   flat cache addresses.
+7. The two `tl.store` calls scatter K and V into those addresses.
+
+The wrapper launches grid `(num_tokens,)`, so there is one program per token.
+This is called a **scatter** because source rows arrive in batch order while
+their destination slots may be anywhere in the paged cache. The write is
+independent of whether the following attention call is prefill or decode.
 
 ## Why it is an entry project, not a production claim
 

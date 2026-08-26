@@ -163,3 +163,16 @@ def test_scheduler_rejects_cache_manager_with_different_block_size(config_factor
             config_factory(kvcache_block_size=4),
             cache_manager=BlockManager(num_blocks=4, block_size=8),
         )
+
+
+def test_scheduler_reports_request_that_can_never_fit_in_cache(config_factory):
+    scheduler = Scheduler(
+        config_factory(
+            max_num_batched_tokens=16,
+            num_kvcache_blocks=1,
+        )
+    )
+    scheduler.add(make_sequence(list(range(5))))
+
+    with pytest.raises(RuntimeError, match="requires 2 KV-cache blocks"):
+        scheduler.schedule()

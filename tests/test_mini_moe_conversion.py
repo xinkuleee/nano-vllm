@@ -89,3 +89,14 @@ def test_converter_rejects_invalid_moe_configuration(
             top_k,
             implementation,
         )
+
+
+def test_converter_accepts_triton_sparse_dispatch(tmp_path):
+    source = tmp_path / "qwen"
+    output = tmp_path / "mini-moe"
+    make_checkpoint(source)
+
+    convert(source, output, [0], 4, 2, "sparse_dispatch")
+
+    config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+    assert config["mini_moe_implementation"] == "sparse_dispatch"

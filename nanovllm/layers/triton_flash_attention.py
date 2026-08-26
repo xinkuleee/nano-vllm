@@ -215,6 +215,8 @@ def _validate_inputs(
         raise ValueError("maximum sequence lengths must be positive")
     if max_seqlen_q > max_seqlen_k:
         raise ValueError("causal self-attention requires max_seqlen_q <= max_seqlen_k")
+    if max_seqlen_q > query.shape[0] or max_seqlen_k > key.shape[0]:
+        raise ValueError("maximum sequence length exceeds packed tensor storage")
     if triton.next_power_of_2(max_seqlen_k) > 65536:
         raise ValueError("teaching FlashAttention supports max_seqlen_k <= 65536")
     if not math.isfinite(softmax_scale):

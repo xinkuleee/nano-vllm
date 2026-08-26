@@ -287,10 +287,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     model_config = _validate_model_architecture(args.model)
     if (
-        getattr(model_config, "mini_moe_implementation", None) == "sparse_dispatch"
+        getattr(model_config, "mini_moe_implementation", None)
+        in {"sparse_reference", "sparse_dispatch", "triton_grouped"}
         and args.mode != "eager"
     ):
-        raise ValueError("Mini-MoE sparse_dispatch requires --mode eager")
+        raise ValueError("sparse Mini-MoE implementations require --mode eager")
     _seed_everything(torch, args.seed)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     prompts = _build_prompts(tokenizer, workload, args.seed)

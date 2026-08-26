@@ -88,15 +88,22 @@ class ModelRunner:
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
+        if n + 4 > len(self.shm.buf):
+            raise ValueError(
+                "tensor-parallel command exceeds shared-memory capacity: "
+                f"{n + 4} > {len(self.shm.buf)} bytes"
+            )
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
         for event in self.event:
             event.set()
 
     def call(self, method_name, *args):
+        method = getattr(self, method_name, None)
+        if method is None or not callable(method):
+            raise ValueError(f"unknown model-runner method: {method_name}")
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
-        method = getattr(self, method_name, None)
         return method(*args)
 
     def warmup_model(self):
@@ -133,8 +140,23 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        local_num_blocks = (
+            int(total * config.gpu_memory_utilization - used - peak + current)
+            // block_bytes
+        )
+        if self.world_size > 1:
+            # The scheduler on rank zero emits physical block IDs used by every
+            # tensor-parallel rank.  Base its capacity on the least-free GPU so
+            # an ID valid on rank zero cannot overrun another rank's cache.
+            shared_capacity = torch.tensor(local_num_blocks, dtype=torch.int64)
+            dist.all_reduce(shared_capacity, op=dist.ReduceOp.MIN)
+            local_num_blocks = int(shared_capacity.item())
+        if local_num_blocks <= 0:
+            raise RuntimeError(
+                "insufficient GPU memory for one KV-cache block; lower "
+                "max_model_len/model size or raise gpu_memory_utilization"
+            )
+        config.num_kvcache_blocks = local_num_blocks
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -261,6 +283,7 @@ class ModelRunner:
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
+            graph_vars["block_tables"].fill_(-1)
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
@@ -309,7 +332,13 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [size for size in (1, 2, 4, 8) if size <= max_bs]
+        self.graph_bs.extend(range(16, max_bs + 1, 16))
+        # ``max_num_seqs`` is user-configurable and need not be a power of two
+        # or a multiple of 16.  Capture its exact upper bound so lookup cannot
+        # fail for, for example, a 9- or 17-sequence decode batch.
+        if self.graph_bs[-1] != max_bs:
+            self.graph_bs.append(max_bs)
         self.graphs = {}
         self.graph_pool = None
 

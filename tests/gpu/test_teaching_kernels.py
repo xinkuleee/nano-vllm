@@ -114,7 +114,7 @@ def test_mini_moe_dense_and_sparse_paths_match():
     sparse = MiniMoE(
         16, [nn.Linear(16, 16, bias=False, device="cuda") for _ in range(4)],
         top_k=2,
-        implementation="sparse_dispatch",
+        implementation="sparse_reference",
     ).cuda()
     sparse.load_state_dict(dense.state_dict())
     hidden = torch.randn(23, 16, device="cuda")

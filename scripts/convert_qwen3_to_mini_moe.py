@@ -53,7 +53,12 @@ def convert(
         raise ValueError(f"layer IDs must be between 0 and {num_layers - 1}")
     if num_experts < 2 or not 1 <= top_k <= num_experts:
         raise ValueError("require num_experts >= 2 and 1 <= top_k <= num_experts")
-    if implementation not in {"dense_masked", "sparse_dispatch"}:
+    if implementation not in {
+        "dense_masked",
+        "sparse_reference",
+        "sparse_dispatch",
+        "triton_grouped",
+    }:
         raise ValueError(f"unknown Mini-MoE implementation: {implementation}")
 
     config["architectures"] = ["Qwen3MiniMoEForCausalLM"]
@@ -86,8 +91,13 @@ def main() -> int:
     parser.add_argument("--top-k", type=int, default=2)
     parser.add_argument(
         "--implementation",
-        choices=("dense_masked", "sparse_dispatch"),
-        default="dense_masked",
+        choices=(
+            "dense_masked",
+            "sparse_reference",
+            "sparse_dispatch",
+            "triton_grouped",
+        ),
+        default="sparse_dispatch",
     )
     args = parser.parse_args()
     convert(

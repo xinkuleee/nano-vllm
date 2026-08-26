@@ -35,6 +35,8 @@ def _run_once(
     *,
     model: Path | None = None,
     attention_backend: str = "flash_attention",
+    max_num_seqs: int = 8,
+    prompts: list[str] | None = None,
 ) -> list[list[int]]:
     torch = _require_gpu_stack()
     model = model or _model_path()
@@ -48,13 +50,13 @@ def _run_once(
         tensor_parallel_size=1,
         max_model_len=1024,
         max_num_batched_tokens=1024,
-        max_num_seqs=8,
+        max_num_seqs=max_num_seqs,
         gpu_memory_utilization=0.75,
         attention_backend=attention_backend,
     )
     try:
         outputs = llm.generate(
-            ["Hello from nano-vLLM.", "Count from one to five."],
+            prompts or ["Hello from nano-vLLM.", "Count from one to five."],
             SamplingParams(temperature=1e-5, max_tokens=8, ignore_eos=True),
             use_tqdm=False,
         )
@@ -74,6 +76,19 @@ def test_cuda_graph_smoke():
     outputs = _run_once(enforce_eager=False)
 
     assert len(outputs) == 2
+    assert all(len(token_ids) == 8 for token_ids in outputs)
+
+
+def test_cuda_graph_supports_non_bucket_max_batch_size():
+    prompts = [f"Request {index}" for index in range(9)]
+
+    outputs = _run_once(
+        enforce_eager=False,
+        max_num_seqs=9,
+        prompts=prompts,
+    )
+
+    assert len(outputs) == 9
     assert all(len(token_ids) == 8 for token_ids in outputs)
 
 

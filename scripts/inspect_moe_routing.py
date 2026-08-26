@@ -19,6 +19,11 @@ def main() -> int:
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--experts", type=int, default=4)
     parser.add_argument("--top-k", type=int, default=2)
+    parser.add_argument(
+        "--implementation",
+        choices=("sparse_reference", "sparse_dispatch", "triton_grouped"),
+        default="sparse_dispatch",
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -29,16 +34,27 @@ def main() -> int:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     torch.manual_seed(args.seed)
-    experts = [
-        nn.Sequential(
-            nn.Linear(args.hidden_size, args.hidden_size * 2, bias=False),
-            nn.SiLU(),
-            nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False),
-        )
-        for _ in range(args.experts)
-    ]
+
+    class SwiGLUExpert(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.gate_up_proj = nn.Linear(
+                args.hidden_size, args.hidden_size * 4, bias=False
+            )
+            self.down_proj = nn.Linear(
+                args.hidden_size * 2, args.hidden_size, bias=False
+            )
+
+        def forward(self, values):
+            gate, up = self.gate_up_proj(values).chunk(2, dim=-1)
+            return self.down_proj(torch.nn.functional.silu(gate) * up)
+
+    experts = [SwiGLUExpert() for _ in range(args.experts)]
     layer = MiniMoE(
-        args.hidden_size, experts, top_k=args.top_k, implementation="sparse_dispatch"
+        args.hidden_size,
+        experts,
+        top_k=args.top_k,
+        implementation=args.implementation,
     ).cuda().half()
     hidden_states = torch.randn(
         args.tokens, args.hidden_size, device="cuda", dtype=torch.float16

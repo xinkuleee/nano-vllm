@@ -1,15 +1,11 @@
 import atexit
 from dataclasses import fields
 from time import perf_counter
-from tqdm.auto import tqdm
-from transformers import AutoTokenizer
-import torch.multiprocessing as mp
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.contracts import (
     EngineStepResult,
     RequestOutput,
@@ -20,7 +16,16 @@ from nanovllm.engine.contracts import (
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
+        import torch.multiprocessing as mp
+        from transformers import AutoTokenizer
+
+        from nanovllm.engine.model_runner import ModelRunner
+
         config_fields = {field.name for field in fields(Config)}
+        unknown_kwargs = set(kwargs).difference(config_fields)
+        if unknown_kwargs:
+            unknown = ", ".join(sorted(unknown_kwargs))
+            raise TypeError(f"unexpected engine configuration: {unknown}")
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
         self.config = config
@@ -28,24 +33,33 @@ class LLMEngine:
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
+        try:
+            for i in range(1, config.tensor_parallel_size):
+                event = ctx.Event()
+                process = ctx.Process(target=ModelRunner, args=(config, i, event))
+                process.start()
+                self.ps.append(process)
+                self.events.append(event)
+            self.model_runner = ModelRunner(config, 0, self.events)
+            self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+            config.eos = self.tokenizer.eos_token_id
+            self.scheduler = Scheduler(config)
+        except Exception:
+            for process in self.ps:
+                if process.is_alive():
+                    process.terminate()
+                process.join()
+            raise
         atexit.register(self.exit)
 
     def exit(self):
         if self._closed:
             return
         self._closed = True
-        self.model_runner.call("exit")
-        del self.model_runner
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            model_runner.call("exit")
+            del self.model_runner
         for p in self.ps:
             p.join()
 
@@ -56,11 +70,38 @@ class LLMEngine:
         self.exit()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
+        prompt = self._prepare_prompt(prompt, sampling_params)
         seq = Sequence(prompt, sampling_params, self.config.kvcache_block_size)
         self.scheduler.add(seq)
         return seq.seq_id
+
+    def _prepare_prompt(
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams,
+    ) -> list[int]:
+        if self._closed:
+            raise RuntimeError("cannot add a request to a closed engine")
+        if isinstance(prompt, str):
+            prompt = self.tokenizer.encode(prompt)
+        if not prompt:
+            raise ValueError("prompt must contain at least one token")
+        if any(
+            not isinstance(token_id, int) or isinstance(token_id, bool)
+            for token_id in prompt
+        ):
+            raise TypeError("prompt token IDs must be integers")
+        # Sampling the final completion token does not require feeding that
+        # token back through the model.  A request for K completion tokens
+        # therefore needs positions for the prompt and only the first K - 1
+        # generated tokens.
+        required_context_len = len(prompt) + sampling_params.max_tokens - 1
+        if required_context_len > self.config.max_model_len:
+            raise ValueError(
+                "prompt length plus max_tokens exceeds the configured "
+                f"max_model_len ({self.config.max_model_len})"
+            )
+        return prompt
 
     def step(self) -> EngineStepResult:
         scheduled = self.scheduler.schedule()
@@ -93,11 +134,31 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[dict[str, str | list[int]]]:
-        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+        if not prompts:
+            return []
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
-        for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
+        elif len(sampling_params) != len(prompts):
+            raise ValueError(
+                "sampling_params must contain exactly one entry per prompt"
+            )
+
+        prepared_prompts = [
+            self._prepare_prompt(prompt, sp)
+            for prompt, sp in zip(prompts, sampling_params)
+        ]
+
+        from tqdm.auto import tqdm
+
+        pbar = tqdm(
+            total=len(prompts),
+            desc="Generating",
+            dynamic_ncols=True,
+            disable=not use_tqdm,
+        )
+        for prompt, sp in zip(prepared_prompts, sampling_params):
+            seq = Sequence(prompt, sp, self.config.kvcache_block_size)
+            self.scheduler.add(seq)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():

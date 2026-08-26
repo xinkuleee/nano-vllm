@@ -69,6 +69,12 @@ class Qwen3MiniMoEForCausalLM(Qwen3ForCausalLM):
             prefix = f"model.layers.{layer_id}.mlp."
             if weight_name.startswith(prefix):
                 suffix = weight_name[len(prefix):]
+                # A saved Mini-MoE checkpoint already owns expert/router
+                # parameters.  Preserve those names so converted models can be
+                # fine-tuned, saved and loaded again.  Only a dense Qwen MLP
+                # tensor should be cloned into every expert.
+                if suffix.startswith(("experts.", "router.")):
+                    return (weight_name,)
                 return tuple(
                     f"{prefix}experts.{expert_id}.{suffix}"
                     for expert_id in range(self.model.layers[layer_id].mlp.num_experts)
@@ -91,6 +97,8 @@ class Qwen3MiniMoEForCausalLM(Qwen3ForCausalLM):
             raise RuntimeError(
                 "checkpoint did not initialise Mini-MoE parameters: " + preview
             )
+        for layer_id in self.mini_moe_layer_ids:
+            self.model.layers[layer_id].mlp.clear_triton_weight_cache()
 
     @torch.no_grad()
     def diversify_experts_(self, noise_std: float, seed: int = 0) -> None:
@@ -117,3 +125,4 @@ class Qwen3MiniMoEForCausalLM(Qwen3ForCausalLM):
                         generator=generator,
                     )
                     parameter.add_(noise * noise_std)
+            moe.clear_triton_weight_cache()

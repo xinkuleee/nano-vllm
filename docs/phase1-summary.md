@@ -129,6 +129,11 @@ Recorded result for this checkpoint:
 | ROCm execution and AMD kernels | Not implemented |
 | Mini-MoE model, routing, and grouped GEMM | Not implemented |
 
+This table is the historical boundary of the Phase 1 checkpoint. Later
+teaching branches add contiguous-prefill Triton FlashAttention and Mini-MoE
+Triton dispatch/grouped GEMM; see `teaching-flash-attention.md` and
+`teaching-mini-moe.md` for their current validation status.
+
 Two review caveats should remain visible:
 
 1. Runtime registry mutations are process-local. A custom model/backend used with

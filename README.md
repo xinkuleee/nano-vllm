@@ -68,6 +68,8 @@ outputs[0]["text"]
 
 ## Runtime architecture
 
+The consolidated implementation and review status is in
+[docs/current-status.md](docs/current-status.md).
 The extensible-runtime branch documents its scheduling, KV-cache, model, and
 attention-backend boundaries in [docs/architecture.md](docs/architecture.md).
 The completed local checkpoint, review evidence, and remaining validation matrix
@@ -85,7 +87,12 @@ Two teaching extensions build on that baseline:
 - [Triton FlashAttention](docs/teaching-flash-attention.md) implements packed
   causal prefill with online softmax and plugs into `AttentionBackend`.
 - [Qwen3 Mini-MoE](docs/teaching-mini-moe.md) implements top-k routing, dense
-  and sparse dispatch, plus a checkpoint-compatible Qwen3 overlay.
+  and Triton sparse dispatch/grouped GEMM, plus a checkpoint-compatible Qwen3
+  overlay.
+- [Beginner kernel glossary](docs/teaching-kernel-glossary.md) explains prefill,
+  decode, paging, FlashAttention and the GPU/Triton vocabulary used by both.
+- [中文逐算子教程](docs/teaching-kernels-zh.md) follows every custom kernel
+  from inputs and launch grid through memory access, math, and limitations.
 
 Both extensions are currently teaching candidates: local control-plane checks
 pass, while NVIDIA JIT compilation, end-to-end parity, and performance remain
